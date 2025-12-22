@@ -1,0 +1,27 @@
+# 数据处理
+pandas>=1.5.0
+numpy>=1.23.0
+scipy>=1.9.0
+
+# 机器学习
+scikit-learn>=1.1.0
+xgboost>=1.7.0
+lightgbm>=3.3.0
+catboost>=1.1.0
+
+# 数据获取
+tushare>=1.2.89
+
+# 可视化
+matplotlib>=3.6.0
+seaborn>=0.12.0
+
+# 工具库
+joblib>=1.2.0
+psutil>=5.9.0
+
+# 优化(可选)
+# cvxpy>=1.2.0  # 组合优化
+
+# 实盘交易(可选)
+# easytrader>=0.22.0  # 实盘交易接口
