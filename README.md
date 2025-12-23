@@ -588,12 +588,13 @@ df = self._calculate_custom_factor(df)
 ## 📞 联系方式
 
 - Issues: 通过GitHub Issues提交问题
-- Email: your.email@example.com
+- Email: gazoeth@gmail.com
 
 ## 📄 许可证
 
 MIT License
 
 ---
+
 
 **免责声明**: 本策略仅供学习研究使用,不构成任何投资建议。股市有风险,投资需谨慎。
