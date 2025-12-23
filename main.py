@@ -168,7 +168,13 @@ class StrategySystem:
         # 5. 选股
         self.logger.info("Selecting stocks...")
         strategy = Strategy(self.config)
-        selected = strategy.select_stocks(df_latest, latest_date)
+        
+        # 根据配置决定使用哪种选股方法
+        if self.config.strategy.use_composite_score:
+            selected = strategy.select_stocks_live(df_latest, latest_date)
+        else:
+            selected = strategy.select_stocks(df_latest, latest_date)
+        
         selected = strategy.calculate_weights(selected)
 
         # 6. 生成交易指令
@@ -187,6 +193,15 @@ class StrategySystem:
 
         # 8. 记录结果
         self._save_live_results(selected, trades, results)
+
+        # 9. 生成实盘推荐看板
+        self.logger.info("Generating live recommendation report...")
+        from enhanced_report import EnhancedReportGenerator
+        enhanced_report = EnhancedReportGenerator(self.config)
+        enhanced_report.generate_live_recommendation_report(
+            selected, 
+            self.config.backtest.output_dir
+        )
 
         self.logger.info("Live trading completed!")
         return results

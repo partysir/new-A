@@ -1,6 +1,9 @@
 """
-回测引擎
-用于策略回测和性能评估
+回测引擎 - 改进版 v2.0
+主要改进：
+1. 集成分级仓位管理系统
+2. 移除旧的二元止损逻辑
+3. 增强日志记录
 """
 
 import logging
@@ -16,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class BacktestEngine:
-    """回测引擎"""
+    """回测引擎 - 改进版"""
 
     def __init__(self, config):
         self.config = config
@@ -25,7 +28,8 @@ class BacktestEngine:
             'portfolio_values': [],
             'positions': [],
             'trades': [],
-            'cash': []
+            'cash': [],
+            'position_scalars': []  # 【新增】记录每日仓位比例
         }
 
     def run(
@@ -47,7 +51,7 @@ class BacktestEngine:
         """
         from strategy import Strategy, RiskManager, MarketTiming, SentimentAnalyzer, PortfolioManager
 
-        logger.info("Starting backtest...")
+        logger.info("Starting backtest with tiered position management...")
 
         # 初始化组件
         strategy = Strategy(self.config)
@@ -55,6 +59,9 @@ class BacktestEngine:
         timing = MarketTiming(self.config)
         sentiment = SentimentAnalyzer(self.config)
         portfolio = PortfolioManager(self.config)
+        
+        # 【关键】将 risk_manager 注入到 portfolio
+        portfolio.set_risk_manager(risk_manager)
 
         # 获取交易日期
         dates = sorted(df_with_scores['trade_date'].unique())
@@ -78,48 +85,59 @@ class BacktestEngine:
             else:
                 market_signal = 1.0
 
-            # 风控检查
+            # 【核心改进】获取当前组合风险状态
             portfolio_value = portfolio.get_portfolio_value(current_prices)
-
-            # 组合止损
-            if risk_manager.check_portfolio_risk(portfolio_value, self.config.backtest.initial_capital, current_date):
-                logger.warning(f"Portfolio stop loss triggered on {current_date}")
+            risk_status = risk_manager.check_portfolio_risk(
+                portfolio_value,
+                self.config.backtest.initial_capital,
+                current_date
+            )
+            
+            # 记录仓位比例（用于后续分析）
+            self.results['position_scalars'].append(risk_status['position_scalar'])
+            
+            # 如果触发空仓（极端止损），清仓并跳过本日
+            if risk_status['action'] == 'stop':
+                logger.critical(f"[{current_date}] 触发空仓止损：{risk_status['message']}")
+                
                 # 清仓
                 for code in list(portfolio.positions.keys()):
-                    shares = portfolio.positions[code]['shares']
                     price = current_prices.get(code, portfolio.positions[code]['cost'])
-                    portfolio._sell_stock(code, shares, price, current_date, reason='组合止损')
+                    portfolio._sell(code, price, current_date, reason='空仓止损')
+                
+                # 记录结果
+                self.results['dates'].append(current_date)
+                self.results['portfolio_values'].append(portfolio.get_portfolio_value(current_prices))
+                self.results['cash'].append(portfolio.cash)
+                self.results['positions'].append(pd.DataFrame())
+                
                 trading_day_count += 1
                 continue
+            
+            # 如果处于减仓状态，记录日志
+            if risk_status['action'] == 'reduce':
+                logger.warning(f"[{current_date}] {risk_status['message']}")
 
-            # 个股止损止盈
-            to_sell = []
-            stop_loss_list = risk_manager.check_stop_loss(portfolio.positions, current_prices)
-            take_profit_list = risk_manager.check_take_profit(portfolio.positions, current_prices)
-            holding_period_list = risk_manager.check_holding_period(current_date)
+            # 个股风控检查（止损/止盈/持仓期）
+            current_scores = {}
+            df_current = df_with_scores[df_with_scores['trade_date'] == current_date]
+            for _, row in df_current.iterrows():
+                current_scores[row['ts_code']] = row.get('ml_score', 0)
+            
+            to_sell = risk_manager.check_risk(
+                portfolio.positions,
+                current_prices,
+                current_scores,
+                current_date
+            )
 
-            to_sell.extend(stop_loss_list)
-            to_sell.extend(take_profit_list)
-            to_sell.extend(holding_period_list)
-
-            for code in set(to_sell):
+            # 执行卖出
+            for code, reason in to_sell:
                 if code in portfolio.positions:
-                    shares = portfolio.positions[code]['shares']
                     price = current_prices.get(code, portfolio.positions[code]['cost'])
-
-                    # 确定卖出原因
-                    if code in stop_loss_list:
-                        reason = '止损'
-                    elif code in take_profit_list:
-                        reason = '止盈'
-                    elif code in holding_period_list:
-                        reason = '持仓期满'
-                    else:
-                        reason = '风控卖出'
-
-                    portfolio._sell_stock(code, shares, price, current_date, reason=reason)
-
-                    # 更新持仓日期
+                    portfolio._sell(code, price, current_date, reason=reason)
+                    
+                    # 清理entry_dates
                     if code in risk_manager.position_entry_dates:
                         del risk_manager.position_entry_dates[code]
 
@@ -143,26 +161,34 @@ class BacktestEngine:
                     # 应用择时信号
                     selected_stocks['weight'] = selected_stocks['weight'] * market_signal
 
-                    # 更新持仓
-                    trades = portfolio.update_positions(selected_stocks, current_prices, current_date)
+                    # 【关键】update_positions 内部会自动应用 position_scalar
+                    trades = portfolio.update_positions(
+                        selected_stocks, current_prices, current_scores, current_date
+                    )
 
                     # 记录新持仓的开始日期
                     for _, row in selected_stocks.iterrows():
                         code = row['ts_code']
-                        if code not in risk_manager.position_entry_dates:
+                        if code in portfolio.positions and code not in risk_manager.position_entry_dates:
                             risk_manager.position_entry_dates[code] = current_date
 
             # 记录结果
+            portfolio_value_end = portfolio.get_portfolio_value(current_prices)
             self.results['dates'].append(current_date)
-            self.results['portfolio_values'].append(portfolio_value)
+            self.results['portfolio_values'].append(portfolio_value_end)
             self.results['cash'].append(portfolio.cash)
             self.results['positions'].append(
                 portfolio.get_positions_df(current_prices, current_date).copy()
             )
 
-            # 进度
-            if (i + 1) % 50 == 0:
-                logger.info(f"Progress: {i+1}/{len(dates)}, Portfolio Value: {portfolio_value:,.2f}")
+            # 进度 + 仓位状态
+            if (i + 1) % 50 == 0 or risk_status['action'] != 'normal':
+                logger.info(
+                    f"Progress: {i+1}/{len(dates)}, "
+                    f"Portfolio: {portfolio_value_end:,.2f}, "
+                    f"仓位: {risk_status['tier_name']}({risk_status['position_scalar']:.0%}), "
+                    f"回撤: {risk_status['drawdown']:.2%}"
+                )
 
             trading_day_count += 1
 
@@ -184,14 +210,6 @@ class BacktestEngine:
     ) -> pd.DataFrame:
         """
         过滤涨停板股票(无法买入)
-
-        Args:
-            selected_stocks: 选中的股票
-            price_data: 价格数据
-            current_date: 当前日期
-
-        Returns:
-            过滤后的股票列表
         """
         if len(selected_stocks) == 0:
             return selected_stocks
@@ -226,7 +244,6 @@ class BacktestEngine:
                 pct_change = (current_close - prev_close) / prev_close
 
                 # ST股票涨停5%, 普通股票涨停10%
-                # 考虑浮点数精度,使用9.8%和4.8%作为阈值
                 is_st = code.startswith('ST') or 'ST' in stock.get('name', '')
                 limit_threshold = 0.048 if is_st else 0.098
 
@@ -251,7 +268,8 @@ class BacktestEngine:
         # 转换为DataFrame
         df = pd.DataFrame({
             'date': self.results['dates'],
-            'portfolio_value': self.results['portfolio_values']
+            'portfolio_value': self.results['portfolio_values'],
+            'position_scalar': self.results['position_scalars']  # 【新增】
         })
 
         # 计算收益率
@@ -304,6 +322,15 @@ class BacktestEngine:
             excess_return = annual_return
             information_ratio = 0
 
+        # 【新增】仓位相关统计
+        position_stats = {
+            'avg_position': df['position_scalar'].mean(),
+            'position_100_pct': (df['position_scalar'] == 1.0).sum() / len(df),
+            'position_50_pct': (df['position_scalar'] == 0.5).sum() / len(df),
+            'position_25_pct': (df['position_scalar'] == 0.25).sum() / len(df),
+            'position_0_pct': (df['position_scalar'] == 0.0).sum() / len(df),
+        }
+
         metrics = {
             'total_return': total_return,
             'annual_return': annual_return,
@@ -316,6 +343,7 @@ class BacktestEngine:
             'information_ratio': information_ratio,
             'calmar_ratio': annual_return / abs(max_drawdown) if max_drawdown < 0 else 0,
             'sortino_ratio': self._calculate_sortino(df['return'], annual_return),
+            'position_stats': position_stats  # 【新增】
         }
 
         return metrics
@@ -355,11 +383,12 @@ class BacktestEngine:
                 positions_df.to_csv(output_path / 'positions.csv', index=False)
 
         if self.config.backtest.save_metrics:
-            # 保存每日净值
+            # 【新增】保存每日净值 + 仓位比例
             equity_df = pd.DataFrame({
                 'date': self.results['dates'],
                 'portfolio_value': self.results['portfolio_values'],
-                'cash': self.results['cash']
+                'cash': self.results['cash'],
+                'position_scalar': self.results['position_scalars']
             })
             equity_df.to_csv(output_path / 'equity_curve.csv', index=False)
 
@@ -373,7 +402,8 @@ class BacktestEngine:
 
         df = pd.DataFrame({
             'date': pd.to_datetime(self.results['dates']),
-            'portfolio_value': self.results['portfolio_values']
+            'portfolio_value': self.results['portfolio_values'],
+            'position_scalar': self.results['position_scalars']  # 【新增】
         })
 
         df['return'] = df['portfolio_value'].pct_change()
@@ -387,20 +417,53 @@ class BacktestEngine:
         plt.style.use('seaborn-v0_8-darkgrid')
         sns.set_palette("husl")
 
-        # 1. 权益曲线
+        # 1. 权益曲线 + 仓位状态（改进版）
         if self.config.backtest.plot_equity_curve:
-            fig, ax = plt.subplots(figsize=(14, 7))
-            ax.plot(df['date'], df['portfolio_value'], linewidth=2, label='Portfolio Value')
-            ax.axhline(y=self.config.backtest.initial_capital, color='r',
-                      linestyle='--', alpha=0.5, label='Initial Capital')
-            ax.set_xlabel('Date', fontsize=12)
-            ax.set_ylabel('Portfolio Value (¥)', fontsize=12)
-            ax.set_title('Portfolio Equity Curve', fontsize=14, fontweight='bold')
-            ax.legend(loc='best')
-            ax.grid(True, alpha=0.3)
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), 
+                                          gridspec_kw={'height_ratios': [3, 1]})
+            
+            # 上图：权益曲线
+            ax1.plot(df['date'], df['portfolio_value'], linewidth=2, label='Portfolio Value', color='steelblue')
+            ax1.axhline(y=self.config.backtest.initial_capital, color='r',
+                       linestyle='--', alpha=0.5, label='Initial Capital')
+            ax1.set_ylabel('Portfolio Value (¥)', fontsize=12)
+            ax1.set_title('Portfolio Equity Curve with Position Management', fontsize=14, fontweight='bold')
+            ax1.legend(loc='best')
+            ax1.grid(True, alpha=0.3)
+            
+            # 下图：仓位比例
+            colors = []
+            for scalar in df['position_scalar']:
+                if scalar == 1.0:
+                    colors.append('green')
+                elif scalar == 0.5:
+                    colors.append('orange')
+                elif scalar == 0.25:
+                    colors.append('red')
+                else:
+                    colors.append('darkred')
+            
+            ax2.fill_between(df['date'], 0, df['position_scalar'] * 100, alpha=0.5, color='steelblue')
+            ax2.scatter(df['date'], df['position_scalar'] * 100, c=colors, s=10, alpha=0.6)
+            ax2.set_xlabel('Date', fontsize=12)
+            ax2.set_ylabel('Position (%)', fontsize=12)
+            ax2.set_title('Daily Position Ratio', fontsize=12)
+            ax2.set_ylim(-5, 105)
+            ax2.grid(True, alpha=0.3)
+            
+            # 添加仓位图例
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor='green', label='正常(100%)'),
+                Patch(facecolor='orange', label='半仓(50%)'),
+                Patch(facecolor='red', label='轻仓(25%)'),
+                Patch(facecolor='darkred', label='空仓(0%)')
+            ]
+            ax2.legend(handles=legend_elements, loc='upper right', fontsize=9)
+            
             plt.xticks(rotation=45)
             plt.tight_layout()
-            plt.savefig(output_path / 'equity_curve.png', dpi=300, bbox_inches='tight')
+            plt.savefig(output_path / 'equity_curve_with_position.png', dpi=300, bbox_inches='tight')
             plt.close()
 
         # 2. 回撤曲线
@@ -408,9 +471,16 @@ class BacktestEngine:
             fig, ax = plt.subplots(figsize=(14, 5))
             ax.fill_between(df['date'], df['drawdown'] * 100, 0, alpha=0.3, color='red')
             ax.plot(df['date'], df['drawdown'] * 100, linewidth=1, color='red')
+            
+            # 标注仓位调整阈值
+            ax.axhline(-10, color='orange', linestyle=':', alpha=0.5, label='半仓阈值(-10%)')
+            ax.axhline(-15, color='red', linestyle=':', alpha=0.5, label='轻仓阈值(-15%)')
+            ax.axhline(-20, color='darkred', linestyle=':', alpha=0.5, label='空仓阈值(-20%)')
+            
             ax.set_xlabel('Date', fontsize=12)
             ax.set_ylabel('Drawdown (%)', fontsize=12)
-            ax.set_title('Portfolio Drawdown', fontsize=14, fontweight='bold')
+            ax.set_title('Portfolio Drawdown with Position Triggers', fontsize=14, fontweight='bold')
+            ax.legend(loc='lower left')
             ax.grid(True, alpha=0.3)
             plt.xticks(rotation=45)
             plt.tight_layout()
@@ -439,11 +509,13 @@ class BacktestEngine:
             plt.savefig(output_path / 'returns_distribution.png', dpi=300, bbox_inches='tight')
             plt.close()
 
-        # 4. 性能指标表
-        fig, ax = plt.subplots(figsize=(10, 8))
+        # 4. 性能指标表（增强版）
+        fig, ax = plt.subplots(figsize=(10, 10))
         ax.axis('tight')
         ax.axis('off')
 
+        position_stats = metrics.get('position_stats', {})
+        
         metrics_data = [
             ['Total Return', f"{metrics['total_return']:.2%}"],
             ['Annual Return', f"{metrics['annual_return']:.2%}"],
@@ -453,9 +525,16 @@ class BacktestEngine:
             ['Max Drawdown', f"{metrics['max_drawdown']:.2%}"],
             ['Calmar Ratio', f"{metrics['calmar_ratio']:.2f}"],
             ['Win Rate', f"{metrics['win_rate']:.2%}"],
+            ['', ''],  # 分隔线
             ['Benchmark Return', f"{metrics['benchmark_annual_return']:.2%}"],
             ['Excess Return', f"{metrics['excess_return']:.2%}"],
             ['Information Ratio', f"{metrics['information_ratio']:.2f}"],
+            ['', ''],  # 分隔线
+            ['Avg Position', f"{position_stats.get('avg_position', 0):.1%}"],
+            ['Full Position Days', f"{position_stats.get('position_100_pct', 0):.1%}"],
+            ['Half Position Days', f"{position_stats.get('position_50_pct', 0):.1%}"],
+            ['Light Position Days', f"{position_stats.get('position_25_pct', 0):.1%}"],
+            ['Zero Position Days', f"{position_stats.get('position_0_pct', 0):.1%}"],
         ]
 
         table = ax.table(cellText=metrics_data, colLabels=['Metric', 'Value'],
@@ -473,11 +552,15 @@ class BacktestEngine:
                 table[(i, 0)].set_text_props(weight='bold', color='white')
                 table[(i, 1)].set_text_props(weight='bold', color='white')
             else:
-                if i % 2 == 0:
+                # 分隔行
+                if metrics_data[i-1][0] == '':
+                    table[(i, 0)].set_facecolor('#cccccc')
+                    table[(i, 1)].set_facecolor('#cccccc')
+                elif i % 2 == 0:
                     table[(i, 0)].set_facecolor('#f1f1f2')
                     table[(i, 1)].set_facecolor('#f1f1f2')
 
-        plt.title('Performance Metrics', fontsize=16, fontweight='bold', pad=20)
+        plt.title('Performance Metrics (Tiered Position System)', fontsize=16, fontweight='bold', pad=20)
         plt.savefig(output_path / 'metrics_table.png', dpi=300, bbox_inches='tight')
         plt.close()
 
@@ -485,7 +568,7 @@ class BacktestEngine:
 
 
 class RealTimeTrader:
-    """实盘交易器"""
+    """实盘交易器（保持不变）"""
 
     def __init__(self, config):
         self.config = config
@@ -499,8 +582,7 @@ class RealTimeTrader:
         if self.config.system.trade_api == 'easytrader':
             try:
                 import easytrader
-                self.api = easytrader.use('ths')  # 同花顺
-                # self.api.connect()  # 连接客户端
+                self.api = easytrader.use('ths')
                 logger.info("EasyTrader API initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize EasyTrader: {e}")
@@ -508,15 +590,7 @@ class RealTimeTrader:
             logger.warning(f"Unknown trade API: {self.config.system.trade_api}")
 
     def execute_trades(self, trades: List[Dict]) -> List[Dict]:
-        """
-        执行交易
-
-        Args:
-            trades: 交易列表
-
-        Returns:
-            执行结果列表
-        """
+        """执行交易"""
         if self.config.system.dry_run:
             logger.info("Dry run mode - trades not executed")
             return trades

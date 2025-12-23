@@ -19,6 +19,7 @@ seaborn>=0.12.0
 # 工具库
 joblib>=1.2.0
 psutil>=5.9.0
+pandarallel>=1.6.4  # 新增并行加速库
 
 # 优化(可选)
 # cvxpy>=1.2.0  # 组合优化

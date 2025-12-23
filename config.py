@@ -82,6 +82,10 @@ class FactorConfig:
         'alpha_001',  # 自定义Alpha因子1
         'alpha_002',  # 自定义Alpha因子2
         'alpha_003',  # 自定义Alpha因子3
+        'alpha_006',  # Alpha101因子
+        'alpha_012',  # Alpha101因子
+        'alpha_023',  # Alpha101因子
+        'alpha_054',  # Alpha101因子
     ])
 
     # 因子处理
@@ -95,6 +99,10 @@ class FactorConfig:
     use_feature_importance: bool = True  # 使用特征重要性
     importance_threshold: float = 0.01  # 重要性阈值
     max_factors: int = 30  # 最大因子数
+    
+    # 【新增】市值中和配置
+    neutralize_market_cap: bool = False  # 启用市值中和（临时改为False）
+    market_cap_deciles: int = 10  # 市值分组数量
 
 
 @dataclass
@@ -163,7 +171,8 @@ class StrategyConfig:
     # 选股
     top_n: int = 10  # 持仓数量
     selection_method: str = "score"  # score, rank, threshold
-    score_threshold: float = 0.6  # 分数阈值(当method='threshold'时使用)
+    score_threshold: float = 0.3  # 分数阈值(当method='threshold'时使用)
+    use_dynamic_threshold: bool = True  # 使用动态阈值
 
     # 权重分配
     weight_method: str = "equal"  # equal, score_weighted, risk_parity, optimize
@@ -181,6 +190,12 @@ class StrategyConfig:
     commission_rate: float = 0.0003  # 佣金费率
     stamp_tax: float = 0.001  # 印花税(仅卖出)
     slippage: float = 0.001  # 滑点
+
+    # [新增] 实盘推荐参数
+    use_composite_score: bool = True     # 是否使用综合评分
+    smart_money_threshold: float = 0.5   # 资金强度阈值
+    trend_energy_threshold: float = 1.0  # 爆发力阈值
+    min_safety_margin: float = 0.05      # 最小安全边际(5%)
 
 
 @dataclass
@@ -214,6 +229,18 @@ class RiskConfig:
     use_sentiment: bool = True
     sentiment_veto_threshold: float = -0.5  # 舆情一票否决阈值
     sentiment_bonus: float = 0.1  # 利好加分
+    
+    # 【新增】分级仓位配置
+    use_tiered_position: bool = True  # 启用分级仓位管理
+    position_confirmation_days: int = 2  # 档位变化确认天数
+    
+    # 分级仓位阈值（回撤百分比: 仓位比例）
+    position_tiers: List[Dict] = field(default_factory=lambda: [
+        {'threshold': 0.10, 'position': 1.00, 'name': '正常'},
+        {'threshold': 0.15, 'position': 0.50, 'name': '半仓'},
+        {'threshold': 0.20, 'position': 0.25, 'name': '轻仓'},
+        {'threshold': 1.00, 'position': 0.00, 'name': '空仓'}
+    ])
 
 
 @dataclass
@@ -248,7 +275,7 @@ class SystemConfig:
 
     # 性能
     use_multiprocessing: bool = True
-    n_jobs: int = -1  # -1表示使用所有CPU核心
+    n_jobs: int = 4  # 建议根据内存情况设置，-1 可能导致内存爆满
     use_gpu: bool = False  # GPU加速(需要安装相应库)
 
     # 内存管理

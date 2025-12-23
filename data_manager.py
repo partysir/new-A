@@ -178,14 +178,27 @@ class DataManager:
                         trade_date=trade_date,
                         fields=fields
                     )
-
-                    if df_day is not None and not df_day.empty:
+                    
+                    # 【新增】获取基本面数据（包含市值）
+                    df_basic = self.ts_pro.daily_basic(
+                        trade_date=trade_date,
+                        fields='ts_code,trade_date,circ_mv,total_mv,pe,pb'
+                    )
+                    
+                    # 合并数据
+                    if df_day is not None and not df_day.empty and df_basic is not None and not df_basic.empty:
+                        df_day = df_day.merge(df_basic, on=['ts_code', 'trade_date'], how='left')
                         df_list.append(df_day)
 
                         # 每10天显示一次进度
                         if (i + 1) % 10 == 0 or i == len(trade_dates) - 1:
                             logger.info(f"Progress: {i+1}/{len(trade_dates)} days, " +
                                       f"got {len(df_day)} records for {trade_date}")
+                        break
+                    elif df_day is not None and not df_day.empty:
+                        # 如果基本面数据为空，仍保留日线数据
+                        df_list.append(df_day)
+                        logger.warning(f"Basic data not available for {trade_date}")
                         break
                     else:
                         logger.warning(f"No data for {trade_date}")

@@ -348,3 +348,60 @@ class EnhancedReportGenerator:
         )
 
         logger.info("绩效汇总已保存")
+
+    def generate_live_recommendation_report(self, selected_stocks: pd.DataFrame, output_dir: str):
+        """
+        [新增] 生成实盘推荐看板
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        if selected_stocks.empty:
+            logger.warning("无推荐股票")
+            return
+
+        # 整理展示字段
+        display_cols = {
+            'ts_code': '代码',
+            'name': '名称',
+            'industry': '行业',
+            'close': '现价',
+            'composite_score': '综合推荐分',  # 新增核心指标
+            'ml_score': 'AI评分',
+            'smart_money_score': '资金强度',   # 新增核心指标
+            'trend_energy': '爆发潜力',      # 新增核心指标
+            'safety_margin': '安全边际',
+            'recommend_reason': '推荐逻辑'
+        }
+        
+        # 确保列存在
+        valid_cols = [c for c in display_cols.keys() if c in selected_stocks.columns]
+        report_df = selected_stocks[valid_cols].rename(columns=display_cols)
+        
+        # 格式化数据
+        if '综合推荐分' in report_df.columns:
+            report_df['综合推荐分'] = report_df['综合推荐分'].round(2)
+        if 'AI评分' in report_df.columns:
+            report_df['AI评分'] = report_df['AI评分'].round(2)
+            
+        # 按综合分排序
+        if '综合推荐分' in report_df.columns:
+            report_df = report_df.sort_values('综合推荐分', ascending=False)
+
+        # 生成建议仓位
+        # 简单的风险平价：波动率越低，仓位越大（归一化后）
+        if 'volatility' in selected_stocks.columns: # 假设有波动率列
+             inv_vol = 1 / selected_stocks['volatility']
+             weights = inv_vol / inv_vol.sum()
+             report_df['建议仓位'] = weights.values
+             report_df['建议仓位'] = report_df['建议仓位'].apply(lambda x: f"{x:.1%}")
+
+        # 保存为Excel
+        file_path = output_path / f"实盘推荐_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        report_df.to_excel(file_path, index=False)
+        
+        logger.info(f"🚀 实盘推荐看板已生成: {file_path}")
+        print("\n" + "="*50)
+        print("今日核心推荐 Top 5:")
+        print(report_df.head(5).to_string(index=False))
+        print("="*50 + "\n")
