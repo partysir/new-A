@@ -147,7 +147,7 @@ class ModelConfig:
 
     # 训练配置
     walk_forward: bool = True  # 滚动训练
-    train_window: int = 252  # 训练窗口(交易日)
+    train_window: int = 100  # 训练窗口(交易日) - 缩短以更快开始交易
     retrain_frequency: int = 20  # 重训练频率(交易日)
 
     # 标签配置

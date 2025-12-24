@@ -95,12 +95,16 @@ class FactorEngine:
         return df
 
     def _calculate_technical_factors(self, df: pd.DataFrame) -> pd.DataFrame:
-        """计算技术因子（保持原逻辑）"""
+        """计算技术因子（优化版）"""
         if 'momentum_20' in self.config.factor.technical_factors:
             df['momentum_20'] = df['close'].pct_change(20)
+            # 稳定化处理：对动量因子进行平滑处理，减少波动
+            df['momentum_20'] = df['momentum_20'].rolling(3).mean()
 
         if 'momentum_60' in self.config.factor.technical_factors:
             df['momentum_60'] = df['close'].pct_change(60)
+            # 稳定化处理：对动量因子进行平滑处理，减少波动
+            df['momentum_60'] = df['momentum_60'].rolling(3).mean()
 
         if 'rsi_14' in self.config.factor.technical_factors:
             df['rsi_14'] = self._calculate_rsi(df['close'], 14)
@@ -108,26 +112,40 @@ class FactorEngine:
         if 'macd' in self.config.factor.technical_factors:
             df['macd'] = self._calculate_macd(df['close'])
 
+        # 【优化】对波动性较大的因子进行平滑处理
         if 'bbands_width' in self.config.factor.technical_factors:
             df['bbands_width'] = self._calculate_bbands_width(df['close'], 20)
+            # 布林带宽度波动较大，进行平滑处理
+            df['bbands_width'] = df['bbands_width'].rolling(5).mean()
 
+        # 【优化】对波动性较大的因子进行平滑处理
         if 'atr_14' in self.config.factor.technical_factors:
             df['atr_14'] = self._calculate_atr(df, 14)
+            # ATR波动较大，进行平滑处理
+            df['atr_14'] = df['atr_14'].rolling(5).mean()
 
         if 'adx_14' in self.config.factor.technical_factors:
             df['adx_14'] = self._calculate_adx(df, 14)
 
         if 'cci_20' in self.config.factor.technical_factors:
             df['cci_20'] = self._calculate_cci(df, 20)
+            # CCI波动较大，进行平滑处理
+            df['cci_20'] = df['cci_20'].rolling(5).mean()
 
         if 'willr_14' in self.config.factor.technical_factors:
             df['willr_14'] = self._calculate_willr(df, 14)
+            # Williams %R波动较大，进行平滑处理
+            df['willr_14'] = df['willr_14'].rolling(5).mean()
 
         if 'stoch_k' in self.config.factor.technical_factors:
             df['stoch_k'] = self._calculate_stoch(df, 14)
+            # 随机指标波动较大，进行平滑处理
+            df['stoch_k'] = df['stoch_k'].rolling(5).mean()
 
         if 'volume_ratio' in self.config.factor.technical_factors:
             df['volume_ratio'] = df['vol'] / df['vol'].rolling(20).mean()
+            # 量比波动较大，进行平滑处理
+            df['volume_ratio'] = df['volume_ratio'].rolling(5).mean()
 
         return df
 

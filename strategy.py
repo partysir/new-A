@@ -266,11 +266,27 @@ class RiskManager:
         
         # 【关键修复】空仓恢复逻辑
         if self.current_position_scalar == 0.0:
-            # 恢复条件：回撤降至15%以下（轻仓阈值）
+            # 记录空仓开始时间（如果尚未记录）
+            if not hasattr(self, 'empty_position_start_date'):
+                self.empty_position_start_date = current_date
+            
+            # 计算空仓持续时间
+            try:
+                from datetime import datetime
+                empty_start = datetime.strptime(str(self.empty_position_start_date), '%Y%m%d')
+                current_dt = datetime.strptime(str(current_date), '%Y%m%d')
+                empty_days = (current_dt - empty_start).days
+            except:
+                empty_days = 0
+            
+            # 恢复条件1：回撤降至15%以下（轻仓阈值）
             if drawdown < 0.15:
                 self.current_position_scalar = 0.25
                 self.drawdown_confirmation_days = 0
                 self.last_drawdown_level = 2  # 轻仓档位
+                
+                # 重置空仓开始时间
+                self.empty_position_start_date = None
                 
                 message = f"空仓恢复：回撤降至{drawdown:.2%}，升至【轻仓】"
                 logger.warning(message)
@@ -282,6 +298,25 @@ class RiskManager:
                     'drawdown': drawdown,
                     'message': message
                 }
+            # 恢复条件2：空仓超过90天，强制尝试小仓位复活（避免死锁）
+            elif empty_days >= 90:
+                self.current_position_scalar = 0.1  # 小仓位尝试
+                self.drawdown_confirmation_days = 0
+                self.last_drawdown_level = 3  # 从轻仓档位开始
+                
+                # 重置空仓开始时间
+                self.empty_position_start_date = None
+                
+                message = f"空仓超90天：强制尝试小仓位(10%)复活，当前回撤{drawdown:.2%}"
+                logger.warning(message)
+                
+                return {
+                    'action': 'normal',
+                    'position_scalar': 0.1,
+                    'tier_name': '试探',
+                    'drawdown': drawdown,
+                    'message': message
+                }
             # 继续空仓等待
             else:
                 return {
@@ -289,7 +324,7 @@ class RiskManager:
                     'position_scalar': 0.0,
                     'tier_name': '空仓',
                     'drawdown': drawdown,
-                    'message': f"空仓中，等待回撤降至15%以下（当前{drawdown:.2%}）"
+                    'message': f"空仓中，已持续{empty_days}天，等待回撤降至15%以下（当前{drawdown:.2%}）"
                 }
         
         # 确定当前应处于哪个档位
