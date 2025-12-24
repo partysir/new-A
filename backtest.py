@@ -90,7 +90,8 @@ class BacktestEngine:
             risk_status = risk_manager.check_portfolio_risk(
                 portfolio_value,
                 self.config.backtest.initial_capital,
-                current_date
+                current_date,
+                index_data=index_data  # 新增参数
             )
             
             # 记录仓位比例（用于后续分析）
@@ -163,7 +164,8 @@ class BacktestEngine:
 
                     # 【关键】update_positions 内部会自动应用 position_scalar
                     trades = portfolio.update_positions(
-                        selected_stocks, current_prices, current_scores, current_date
+                        selected_stocks, current_prices, current_scores, current_date,
+                        index_data=index_data  # 新增参数
                     )
 
                     # 记录新持仓的开始日期

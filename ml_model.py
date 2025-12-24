@@ -268,11 +268,19 @@ class LabelGenerator:
     @staticmethod
     def add_labels(df, config):
         """根据配置添加标签"""
-        # 1. 基础收益率标签
+        # 1. 预测次日开盘收益（而非收盘收益）
         periods = config.model.forward_return_days
-        df['forward_return'] = df.groupby('ts_code')['close'].shift(-periods) / df['close'] - 1
+        
+        # 计算次日开盘相对今日收盘的收益
+        df['next_open'] = df.groupby('ts_code')['open'].shift(-1)
+        df['forward_return'] = (df['next_open'] - df['close']) / df['close']
+        
+        # 2. 如果启用了夏普比率作为目标（更稳健的指标）
+        # 计算波动率作为分母
+        df['volatility'] = df.groupby('ts_code')['close'].pct_change().rolling(5).std().shift(-periods)
+        df['sharpe_like'] = df['forward_return'] / (df['volatility'] + 1e-8)  # 避免除零
 
-        # 2. 如果启用 Triple Barrier (高级标签)
+        # 3. 如果启用 Triple Barrier (高级标签)
         # 这里我们默认启用以增强效果
         labeler = TripleBarrierLabeler(
             profit_threshold=0.05,

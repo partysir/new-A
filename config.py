@@ -170,7 +170,7 @@ class StrategyConfig:
     """策略配置"""
     # 选股
     top_n: int = 10  # 持仓数量
-    selection_method: str = "score"  # score, rank, threshold
+    selection_method: str = "rank"  # rank, top_n, score - 使用rank避免因绝对阈值导致选不到股票
     score_threshold: float = 0.3  # 分数阈值(当method='threshold'时使用)
     use_dynamic_threshold: bool = True  # 使用动态阈值
 
