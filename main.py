@@ -246,7 +246,7 @@ class StrategySystem:
         results = model.train(X_train, y_train, X_val, y_val)
 
         # 5. 保存模型
-        model_path = Path(self.config.system.cache_factors) / 'latest_model.pkl'
+        model_path = Path(self.config.data.cache_dir) / 'latest_model.pkl'
         model.save(str(model_path))
 
         # 6. 特征重要性
@@ -264,9 +264,11 @@ class StrategySystem:
         if incremental and self.config.data.incremental_update:
             df = self.data_manager.incremental_update()
         else:
+            # 处理可能为None的end_date
+            end_date = self.config.data.end_date or datetime.now().strftime('%Y%m%d')
             df = self.data_manager.get_daily_data(
                 start_date=self.config.data.start_date,
-                end_date=self.config.data.end_date
+                end_date=end_date
             )
 
         # 获取行业信息
@@ -277,7 +279,7 @@ class StrategySystem:
 
     def _load_or_train_model(self, df: pd.DataFrame):
         """加载或训练模型"""
-        model_path = Path(self.config.system.cache_factors) / 'latest_model.pkl'
+        model_path = Path(self.config.data.cache_dir) / 'latest_model.pkl'
 
         if model_path.exists():
             self.logger.info("Loading existing model...")

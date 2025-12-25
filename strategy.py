@@ -41,24 +41,60 @@ class Strategy:
         # 2. 【关键修改】排除"明天买不到"的股票
         # 不仅过滤涨停,还要过滤"已经涨太多"的股票
         if 'pct_chg' in df_date.columns and 'is_st' in df_date.columns:
-            df_date = df_date[
-                (df_date['pct_chg'] < 7.0) &  # 涨幅<7%,避免次日高开买不到
-                (df_date['pct_chg'] > -9.0) &  # 跌幅<9%,避免买到垃圾
-                (df_date['is_st'] == 0)
-            ]
-            logger.info(f"[{date}] 过滤涨幅>7%的股票,剩余{len(df_date)}只")
+            # 2.1 今日涨幅<5% (更保守),避免次日高开买不到
+            mask_today = df_date['pct_chg'] < 5.0
+            
+            # 2.2 跌幅<9%,避免买到垃圾
+            mask_fall = df_date['pct_chg'] > -9.0
+            
+            # 2.3 非ST股票
+            mask_st = df_date['is_st'] == 0
+            
+            df_date = df_date[mask_today & mask_fall & mask_st]
+            
+            logger.info(f"[{date}] 过滤涨幅>5%的股票,剩余{len(df_date)}只")
         
-        # 3. 流动性过滤
+        # 3. 【新增】近3日累计涨幅<15%,避免追高
+        if 'close' in df_date.columns:
+            # 计算近3日累计涨幅
+            df_date = df_date.copy()
+            df_with_pct = df[df['trade_date'] <= date].copy()
+            df_with_pct['pct_chg_3d'] = df_with_pct.groupby('ts_code')['close'].pct_change(3)
+            
+            # 获取当前日期的3日涨幅
+            current_3d_chg = df_with_pct[df_with_pct['trade_date'] == date].set_index('ts_code')['pct_chg_3d']
+            df_date = df_date.join(current_3d_chg, on='ts_code', rsuffix='_3d')
+            df_date = df_date[df_date['pct_chg_3d'] < 0.15]
+            
+            logger.info(f"[{date}] 过滤近3日涨幅>15%的股票,剩余{len(df_date)}只")
+        
+        # 4. 流动性过滤
         if 'amount' in df_date.columns:
             df_date = df_date[df_date['amount'] > 1e7]  # 成交额>1000万
 
-        # 4. 【新增】避免追高 - 过滤短期暴涨股
-        if 'momentum_5' in df_date.columns:
-            # 5日涨幅超过20%的不买(可能是游资炒作)
-            df_date['momentum_5'] = df_date['close'].pct_change(5)
-            df_date = df_date[df_date['momentum_5'] < 0.20]
+        # 5. 【新增】避免追高 - 过滤量能暴增股
+        if 'vol' in df_date.columns:
+            # 计算量比
+            df_date['volume_ratio'] = df_date['vol'] / df_date.groupby('ts_code')['vol'].transform(lambda x: x.rolling(20).mean())
+            df_date = df_date[df_date['volume_ratio'] < 3.0]  # 量比<3倍
+            logger.info(f"[{date}] 过滤量比>3的股票,剩余{len(df_date)}只")
 
-        # === 第二层: 评分过滤 ===
+        # === 第二层: 低位启动选股逻辑 ===
+        if 'momentum_20' in df_date.columns and 'rsi_14' in df_date.columns:
+            # 寻找:近期下跌后开始反弹的股票
+            mask_low_position = (
+                (df_date['momentum_20'] > -0.10) &  # 20日跌幅<10%
+                (df_date['momentum_20'] < 0.05) &   # 但未大涨
+                (df_date['rsi_14'] > 40) &          # RSI从超卖恢复
+                (df_date['rsi_14'] < 70)            # 但未超买
+            )
+            
+            # 优先选择低位股
+            df_date['is_low_position'] = mask_low_position
+            df_date = df_date.sort_values(['is_low_position', 'ml_score'], 
+                                          ascending=[False, False])
+        
+        # === 第三层: 评分过滤 ===
         
         # 根据选股方法决定是否使用硬阈值
         if self.config.strategy.selection_method in ['score', 'threshold']:
@@ -70,7 +106,7 @@ class Strategy:
             df_date = df[df['trade_date'] == date].copy()
             logger.warning(f"[{date}] 过滤后为空,放宽限制")
 
-        # === 第三层: 排序与行业约束 ===
+        # === 第四层: 排序与行业约束 ===
         
         df_date = df_date.sort_values('ml_score', ascending=False)
 
@@ -78,7 +114,7 @@ class Strategy:
         if self.config.strategy.max_industry_weight < 1.0:
             df_date = self._apply_industry_constraints(df_date)
 
-        # === 第四层: 最终筛选 ===
+        # === 第五层: 最终筛选 ===
         
         # 【关键修改】增加缓冲数量,防止第二天开盘时部分股票涨停买不到
         buffer_multiplier = 1.5  # 多选50%作为备选
@@ -96,47 +132,135 @@ class Strategy:
         return selected
 
     def select_stocks_live(self, df: pd.DataFrame, date: str) -> pd.DataFrame:
-        """实盘专用选股逻辑(保持原有逻辑)"""
+        """
+        实盘选股逻辑 - 完全重写版
+        
+        核心改进:
+        1. 简化为三层筛选(清晰明确)
+        2. 避免追高(严格过滤)
+        3. 动态推荐数量(质量优先)
+        4. 增强输出信息
+        """
         df_date = df[df['trade_date'] == date].copy()
-        if len(df_date) == 0:
+        
+        if df_date.empty:
+            logger.warning(f"[{date}] 无可用数据")
             return pd.DataFrame()
-
-        # 第一层: 硬性风控过滤
-        if 'pct_chg' in df_date.columns and 'vol_ma20' in df_date.columns:
-            mask_crash = (df_date['pct_chg'] < -7) & (df_date['vol'] > 1.5 * df_date['vol_ma20'])
-        else:
-            mask_crash = pd.Series([False] * len(df_date), index=df_date.index)
-            
-        if 'rsi_14' in df_date.columns:
-            mask_overbought = df_date['rsi_14'] > 85
-        else:
-            mask_overbought = pd.Series([False] * len(df_date), index=df_date.index)
         
-        df_candidates = df_date[~(mask_crash | mask_overbought)].copy()
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🎯 实盘选股开始: {date}")
+        logger.info(f"{'='*60}")
+        logger.info(f"初始候选池: {len(df_date)} 只股票")
         
-        # 第二层: ML模型初选
-        top_percentile = max(1, int(len(df_candidates) * 0.2))
-        df_candidates = df_candidates.sort_values('ml_score', ascending=False).head(top_percentile)
-
-        # 第三层: 实盘指标加权
-        def normalize(series):
-            if series.max() == series.min():
-                return pd.Series([0.5] * len(series), index=series.index)
-            return (series - series.min()) / (series.max() - series.min())
-
-        for col in ['smart_money_score', 'trend_energy', 'safety_margin']:
-            if col not in df_candidates.columns:
-                df_candidates[col] = 0.5
-
-        df_candidates['composite_score'] = (
-            0.5 * df_candidates['ml_score'] + 
-            0.3 * normalize(df_candidates['smart_money_score']) +
-            0.2 * normalize(df_candidates['trend_energy'])
+        # ===== 第一层: 基础过滤(排除不可交易股票) =====
+        logger.info("\n[第一层] 基础过滤...")
+        
+        # 1.1 市值过滤(排除微盘股)
+        if 'circ_mv' in df_date.columns:
+            mv_threshold = df_date['circ_mv'].quantile(0.20)
+            mask_mv = df_date['circ_mv'] > mv_threshold
+            logger.info(f"  市值过滤: {mask_mv.sum()} 只 (>20分位数)")
+        else:
+            mask_mv = pd.Series([True] * len(df_date))
+        
+        # 1.2 涨跌幅过滤(严格,避免追高)
+        if 'pct_chg' in df_date.columns:
+            mask_price = (
+                (df_date['pct_chg'] < 5.0) &   # 今日涨幅<5% (从7%收紧)
+                (df_date['pct_chg'] > -8.0)    # 今日跌幅>-8%
+            )
+            logger.info(f"  涨跌幅过滤: {mask_price.sum()} 只 (涨幅<5%, 跌幅>-8%)")
+        else:
+            mask_price = pd.Series([True] * len(df_date))
+        
+        # 1.3 ST股票过滤
+        if 'is_st' in df_date.columns:
+            mask_st = df_date['is_st'] == 0
+            logger.info(f"  ST过滤: {mask_st.sum()} 只")
+        else:
+            mask_st = pd.Series([True] * len(df_date))
+        
+        # 1.4 流动性过滤
+        if 'amount' in df_date.columns:
+            mask_liquidity = df_date['amount'] > 1e7  # 成交额>1000万
+            logger.info(f"  流动性过滤: {mask_liquidity.sum()} 只 (成交额>1000万)")
+        else:
+            mask_liquidity = pd.Series([True] * len(df_date))
+        
+        # 1.5 【新增】短期暴涨过滤(防止接盘)
+        if 'momentum_5' in df_date.columns:
+            mask_momentum = df_date['momentum_5'] < 0.20  # 5日涨幅<20%
+            logger.info(f"  短期暴涨过滤: {mask_momentum.sum()} 只 (5日涨幅<20%)")
+        else:
+            # 如果没有momentum_5,手动计算
+            df_date['momentum_5_temp'] = df_date.groupby('ts_code')['close'].pct_change(5)
+            mask_momentum = df_date['momentum_5_temp'].fillna(0) < 0.20
+        
+        # 1.6 【新增】量能过滤(防止游资)
+        if 'volume_ratio' in df_date.columns:
+            mask_volume = df_date['volume_ratio'] < 3.0  # 量比<3
+            logger.info(f"  量能过滤: {mask_volume.sum()} 只 (量比<3)")
+        else:
+            mask_volume = pd.Series([True] * len(df_date))
+        
+        # 综合过滤
+        mask_basic = mask_mv & mask_price & mask_st & mask_liquidity & mask_momentum & mask_volume
+        df_filtered = df_date[mask_basic].copy()
+        
+        logger.info(f"✅ 第一层通过: {len(df_filtered)} 只")
+        
+        if df_filtered.empty:
+            logger.warning("基础过滤后无候选股票")
+            return pd.DataFrame()
+        
+        # ===== 第二层: ML模型精选 =====
+        logger.info("\n[第二层] ML模型精选...")
+        
+        # 按ML分数排序,取Top 30
+        df_filtered = df_filtered.sort_values('ml_score', ascending=False)
+        top_ml = df_filtered.head(30).copy()
+        
+        logger.info(f"  ML分数范围: {top_ml['ml_score'].min():.3f} ~ {top_ml['ml_score'].max():.3f}")
+        logger.info(f"  平均ML分数: {top_ml['ml_score'].mean():.3f}")
+        logger.info(f"✅ 第二层通过: {len(top_ml)} 只")
+        
+        # ===== 第三层: 综合评分微调 =====
+        logger.info("\n[第三层] 综合评分微调...")
+        
+        # 计算辅助指标
+        top_ml = self._calculate_enhanced_indicators(top_ml)
+        
+        # 综合评分(ML为主,辅助指标为辅)
+        top_ml['composite_score'] = (
+            0.60 * top_ml['ml_score'] +                    # 主要看ML (从0.5提高到0.6)
+            0.25 * top_ml['smart_money_score_norm'] +      # 次要看资金
+            0.15 * top_ml['trend_energy_norm']             # 辅助看趋势
         )
-
-        # 第四层: 最终Top N
-        final_selection = df_candidates.sort_values('composite_score', ascending=False).head(self.config.strategy.top_n)
-        final_selection['recommend_reason'] = final_selection.apply(self._generate_reason, axis=1)
+        
+        # 按综合分数排序
+        top_ml = top_ml.sort_values('composite_score', ascending=False)
+        
+        # ===== 第四层: 动态数量筛选 =====
+        logger.info("\n[第四层] 动态数量筛选...")
+        
+        # 质量阈值
+        quality_threshold = 0.65  # 综合分数>0.65才推荐
+        high_quality = top_ml[top_ml['composite_score'] > quality_threshold]
+        
+        if len(high_quality) >= 5:
+            # 有足够的高质量股票
+            final_selection = high_quality.head(20)  # 最多推荐20只
+            logger.info(f"  高质量股票: {len(high_quality)} 只 (分数>{quality_threshold})")
+        else:
+            # 高质量股票不足,降低标准
+            logger.warning(f"  高质量股票不足({len(high_quality)}只), 降低标准")
+            final_selection = top_ml.head(max(5, len(high_quality)))  # 至少推荐5只
+        
+        # ===== 增强输出信息 =====
+        final_selection = self._enhance_output(final_selection)
+        
+        logger.info(f"✅ 最终推荐: {len(final_selection)} 只")
+        logger.info(f"{'='*60}\n")
         
         return final_selection
 
@@ -207,6 +331,153 @@ class Strategy:
         if freq == 'n_days':
             return trading_day_count % self.config.strategy.rebalance_day == 0
         return False
+
+    def _calculate_enhanced_indicators(self, df):
+        """
+        计算增强版辅助指标 - 修复版
+        
+        修复要点:
+        1. 防止NaN传播
+        2. 防止除零错误
+        3. 归一化到0-1区间
+        """
+        # 1. 资金流向 (修复版)
+        if 'turnover_rate' in df.columns:
+            # 防止除零
+            price_range = df['high'] - df['low']
+            price_strength = np.where(
+                price_range > 0.001,  # 波动大于0.1分钱
+                (df['close'] - df['open']) / price_range,
+                0
+            )
+            df['smart_money_score'] = price_strength * df['turnover_rate']
+        else:
+            df['smart_money_score'] = 0
+        
+        # 归一化到0-1
+        if df['smart_money_score'].std() > 0:
+            df['smart_money_score_norm'] = (
+                df['smart_money_score'] - df['smart_money_score'].min()
+            ) / (df['smart_money_score'].max() - df['smart_money_score'].min() + 1e-9)
+        else:
+            df['smart_money_score_norm'] = 0.5
+        
+        # 2. 趋势动能 (修复版)
+        if 'ma20' in df.columns and 'vol_ma20' in df.columns:
+            # 防止NaN
+            price_momentum = (df['close'] / df['ma20'].fillna(df['close']) - 1).clip(-0.5, 0.5)
+            volume_momentum = (df['vol'] / df['vol_ma20'].fillna(df['vol']) - 1).clip(-0.5, 0.5)
+            df['trend_energy'] = price_momentum + volume_momentum
+        else:
+            df['trend_energy'] = 0
+        
+        # 归一化
+        if df['trend_energy'].std() > 0:
+            df['trend_energy_norm'] = (
+                df['trend_energy'] - df['trend_energy'].min()
+            ) / (df['trend_energy'].max() - df['trend_energy'].min() + 1e-9)
+        else:
+            df['trend_energy_norm'] = 0.5
+        
+        # 3. 安全边际 (修复版)
+        if 'pe' in df.columns:
+            # PE在10-30之间最安全
+            df['safety_margin'] = np.where(
+                (df['pe'] > 0) & (df['pe'] < 100),
+                1 - np.abs(df['pe'] - 20) / 20,
+                0
+            )
+        else:
+            df['safety_margin'] = 0.5
+        
+        # 4. 【新增】支撑位距离
+        if 'support_20' in df.columns:
+            df['distance_to_support'] = (df['close'] - df['support_20']) / df['close']
+        else:
+            df['distance_to_support'] = 0.5
+        
+        return df
+    
+    def _enhance_output(self, df):
+        """
+        增强输出信息
+        
+        新增字段:
+        1. 信号强度 (弱买入/买入/强买入)
+        2. 预期收益率 (基于历史统计)
+        3. 风险等级 (低/中/高)
+        4. 建议持有期
+        5. 买入紧迫性
+        """
+        # 1. 信号强度
+        df['signal_strength'] = pd.cut(
+            df['composite_score'],
+            bins=[0, 0.65, 0.75, 1.0],
+            labels=['弱买入⭐', '买入⭐⭐', '强买入⭐⭐⭐']
+        )
+        
+        # 2. 预期收益率 (简化模型: 评分*8%)
+        df['expected_return'] = df['ml_score'] * 0.08
+        df['expected_return_str'] = df['expected_return'].apply(lambda x: f"+{x:.1%}")
+        
+        # 3. 风险等级
+        if 'volatility' in df.columns:
+            df['risk_level'] = pd.cut(
+                df['volatility'],
+                bins=[0, 0.02, 0.04, 1.0],
+                labels=['低风险🟢', '中风险🟡', '高风险🔴']
+            )
+        else:
+            df['risk_level'] = '中风险🟡'
+        
+        # 4. 建议持有期
+        if 'trend_energy' in df.columns:
+            df['hold_period'] = np.where(
+                df['trend_energy'] > 1.0,
+                '5-10天(短线)',
+                '20-30天(中线)'
+            )
+        else:
+            df['hold_period'] = '10-20天'
+        
+        # 5. 买入紧迫性
+        df['urgency'] = pd.cut(
+            df['momentum_5'] if 'momentum_5' in df.columns else df['composite_score'],
+            bins=[-1, 0, 0.05, 1],
+            labels=['观望', '今日可买', '立即买入']
+        )
+        
+        # 6. 【新增】推荐理由(详细版)
+        def generate_detailed_reason(row):
+            reasons = []
+            
+            # ML分数
+            if row['ml_score'] > 0.8:
+                reasons.append("AI高度确信")
+            elif row['ml_score'] > 0.6:
+                reasons.append("AI看好")
+            
+            # 资金流向
+            if row.get('smart_money_score_norm', 0) > 0.7:
+                reasons.append("主力资金抢筹")
+            elif row.get('smart_money_score_norm', 0) > 0.5:
+                reasons.append("资金流入")
+            
+            # 趋势
+            if row.get('trend_energy_norm', 0) > 0.7:
+                reasons.append("趋势强劲")
+            elif row.get('trend_energy_norm', 0) > 0.5:
+                reasons.append("趋势向上")
+            
+            # 位置
+            if row.get('distance_to_support', 0.5) < 0.1:
+                reasons.append("接近支撑位")
+            
+            return " + ".join(reasons) if reasons else "综合评分优选"
+        
+        df['recommend_reason_detail'] = df.apply(generate_detailed_reason, axis=1)
+        
+        return df
 
 
 class RiskManager:
@@ -359,9 +630,19 @@ class RiskManager:
                         target_position = 0.3
                         tier_name = "轻仓(防守)"
                     
-                    # 平滑仓位变化(避免频繁调整)
-                    position_change = abs(target_position - self.current_position_scalar)
-                    if position_change < 0.1:
+                    # 【优化】平滑仓位变化(避免过于激进的调整)
+                    # 限制单次仓位调整幅度不超过20%
+                    max_position_change = 0.2
+                    position_change = target_position - self.current_position_scalar
+                    
+                    if abs(position_change) > max_position_change:
+                        if position_change > 0:
+                            target_position = self.current_position_scalar + max_position_change
+                        else:
+                            target_position = self.current_position_scalar - max_position_change
+                    
+                    # 如果仓位变化很小，则维持当前仓位
+                    if abs(target_position - self.current_position_scalar) < 0.05:
                         target_position = self.current_position_scalar
                     
                     self.current_position_scalar = target_position
@@ -393,6 +674,21 @@ class RiskManager:
         else:
             target_position = 0.3  # 最低30%,永不空仓
             tier_name = "轻仓"
+        
+        # 【优化】平滑仓位变化(避免过于激进的调整)
+        # 限制单次仓位调整幅度不超过20%
+        max_position_change = 0.2
+        position_change = target_position - self.current_position_scalar
+        
+        if abs(position_change) > max_position_change:
+            if position_change > 0:
+                target_position = self.current_position_scalar + max_position_change
+            else:
+                target_position = self.current_position_scalar - max_position_change
+        
+        # 如果仓位变化很小，则维持当前仓位
+        if abs(target_position - self.current_position_scalar) < 0.05:
+            target_position = self.current_position_scalar
         
         self.current_position_scalar = max(target_position, self.min_position)
         

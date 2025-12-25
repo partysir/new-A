@@ -79,6 +79,9 @@ class FactorEngine:
 
         df_with_factors = self.calculate_realtime_indicators(df_with_factors)
         
+        # 因子质量控制
+        df_with_factors = self.factor_quality_control(df_with_factors)
+        
         logger.info(f"Factor calculation completed: {len(df_with_factors)} records")
         return df_with_factors
 
@@ -95,22 +98,79 @@ class FactorEngine:
         return df
 
     def _calculate_technical_factors(self, df: pd.DataFrame) -> pd.DataFrame:
-        """计算技术因子（优化版）"""
+        """计算技术因子（稳健版）"""
+        # === 改进1: 多周期动量综合 ===
+        # 不只看单一周期,综合多个周期减少噪音
+        if 'momentum_composite' in self.config.factor.technical_factors:
+            df['momentum_composite'] = (
+                0.4 * df['close'].pct_change(5) +   # 短期
+                0.3 * df['close'].pct_change(20) +  # 中期
+                0.3 * df['close'].pct_change(60)    # 长期
+            ).rolling(3).mean()  # 平滑处理
+
+        # === 改进2: 波动率调整动量 ===
+        # 高波动股票的动量信号可靠性低,需要惩罚
         if 'momentum_20' in self.config.factor.technical_factors:
             df['momentum_20'] = df['close'].pct_change(20)
-            # 稳定化处理：对动量因子进行平滑处理，减少波动
-            df['momentum_20'] = df['momentum_20'].rolling(3).mean()
+            df['volatility_20'] = df['close'].pct_change().rolling(20).std()
+            df['momentum_adjusted'] = df['momentum_20'] / (df['volatility_20'] + 0.01)
+            # 平滑处理
+            df['momentum_adjusted'] = df['momentum_adjusted'].rolling(3).mean()
 
         if 'momentum_60' in self.config.factor.technical_factors:
             df['momentum_60'] = df['close'].pct_change(60)
-            # 稳定化处理：对动量因子进行平滑处理，减少波动
-            df['momentum_60'] = df['momentum_60'].rolling(3).mean()
+            df['volatility_60'] = df['close'].pct_change().rolling(60).std()
+            df['momentum_60_adjusted'] = df['momentum_60'] / (df['volatility_60'] + 0.01)
+            # 平滑处理
+            df['momentum_60_adjusted'] = df['momentum_60_adjusted'].rolling(5).mean()
 
+        # === 改进3: 量价一致性 ===
+        # 价涨量增才是真突破,价涨量缩要警惕
+        if 'volume_price_consistency' in self.config.factor.technical_factors:
+            price_change_5 = df['close'].pct_change(5)
+            volume_change_5 = df['vol'].pct_change(5)
+            df['vp_consistency'] = np.sign(price_change_5) == np.sign(volume_change_5)
+            df['vp_consistency_score'] = df['vp_consistency'].rolling(10).mean()
+
+        # === 改进4: 支撑压力位 ===
+        # 接近支撑位买入,接近压力位卖出
+        if 'price_position' in self.config.factor.technical_factors:
+            df['support_20'] = df['low'].rolling(20).min()
+            df['resistance_20'] = df['high'].rolling(20).max()
+            df['price_position'] = (
+                (df['close'] - df['support_20']) / 
+                (df['resistance_20'] - df['support_20'] + 0.01)
+            )
+
+        # === 改进5: 趋势一致性(多周期) ===
+        # MA5 > MA10 > MA20 > MA60 = 多头排列
+        if 'trend_alignment' in self.config.factor.technical_factors:
+            df['ma5'] = df['close'].rolling(5).mean()
+            df['ma10'] = df['close'].rolling(10).mean()
+            df['ma20'] = df['close'].rolling(20).mean()
+            df['ma60'] = df['close'].rolling(60).mean()
+            
+            df['trend_alignment'] = (
+                (df['ma5'] > df['ma10']).astype(int) +
+                (df['ma10'] > df['ma20']).astype(int) +
+                (df['ma20'] > df['ma60']).astype(int)
+            ) / 3.0  # 归一化到0-1
+
+        # === 改进6: 反转因子(短期超跌反弹) ===
+        if 'reversal_5' in self.config.factor.technical_factors:
+            df['reversal_5'] = -df['close'].pct_change(5)  # 取反，超跌反弹
+            df['reversal_5'] = df['reversal_5'].rolling(3).mean()  # 平滑
+
+        # === 保留并优化传统指标 ===
         if 'rsi_14' in self.config.factor.technical_factors:
             df['rsi_14'] = self._calculate_rsi(df['close'], 14)
+            # 平滑处理
+            df['rsi_14'] = df['rsi_14'].rolling(5).mean()
 
         if 'macd' in self.config.factor.technical_factors:
             df['macd'] = self._calculate_macd(df['close'])
+            # 平滑处理
+            df['macd'] = df['macd'].rolling(3).mean()
 
         # 【优化】对波动性较大的因子进行平滑处理
         if 'bbands_width' in self.config.factor.technical_factors:
@@ -126,6 +186,8 @@ class FactorEngine:
 
         if 'adx_14' in self.config.factor.technical_factors:
             df['adx_14'] = self._calculate_adx(df, 14)
+            # 平滑处理
+            df['adx_14'] = df['adx_14'].rolling(3).mean()
 
         if 'cci_20' in self.config.factor.technical_factors:
             df['cci_20'] = self._calculate_cci(df, 20)
@@ -320,6 +382,67 @@ class FactorEngine:
         support_level = df['low'].rolling(20).min()
         df['safety_margin'] = (df['close'] - support_level) / df['close']
 
+        return df
+
+    def factor_quality_control(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        因子质量控制 - 剔除低质量因子
+        """
+        factor_cols = [c for c in df.columns if c.startswith(('momentum_', 'alpha_', 'vp_', 'rsi_', 'macd', 'cci_', 'willr_', 'stoch_', 'volume_', 'price_', 'trend_', 'reversal_'))]
+        
+        for factor in factor_cols:
+            if factor not in df.columns:
+                continue
+                
+            # 1. 检查缺失率
+            missing_rate = df[factor].isna().sum() / len(df)
+            if missing_rate > 0.3:
+                logger.warning(f"Factor {factor} has {missing_rate:.1%} missing, dropping")
+                df = df.drop(columns=[factor])
+                continue
+            
+            # 2. 检查信息系数(IC) - 如果有forward_return列
+            if 'forward_return' in df.columns:
+                # 计算IC时去除NaN值
+                mask = ~(df[factor].isna() | df['forward_return'].isna())
+                if mask.sum() > 100:  # 确保有足够的数据点
+                    ic = df.loc[mask, factor].corr(df.loc[mask, 'forward_return'])
+                    if pd.isna(ic) or abs(ic) < 0.02:  # IC绝对值<2%,说明几乎无预测力
+                        logger.warning(f"Factor {factor} has low IC={ic:.4f}, dropping")
+                        df = df.drop(columns=[factor])
+                        continue
+            
+            # 3. 检查单调性(防止过拟合) - 如果有forward_return列
+            # 好的因子应该在分组后收益单调递增/递减
+            if 'forward_return' in df.columns:
+                # 创建因子分组
+                mask = ~(df[factor].isna() | df['forward_return'].isna())
+                if mask.sum() > 100:  # 确保有足够的数据点
+                    df_temp = df.loc[mask].copy()
+                    try:
+                        # 使用qcut进行分组，处理重复值问题
+                        df_temp['factor_quantile'] = pd.qcut(df_temp[factor], q=5, labels=False, duplicates='drop')
+                        
+                        if 'factor_quantile' in df_temp.columns and df_temp['factor_quantile'].notna().any():
+                            # 计算各分组的平均收益
+                            quantile_returns = df_temp.groupby('factor_quantile')['forward_return'].mean()
+                            
+                            if len(quantile_returns) >= 3:  # 至少需要3个分组来计算单调性
+                                # 计算单调性: Spearman相关系数
+                                from scipy.stats import spearmanr
+                                monotonicity, _ = spearmanr(quantile_returns.index, quantile_returns.values)
+                                
+                                if pd.isna(monotonicity) or abs(monotonicity) < 0.5:
+                                    logger.warning(f"Factor {factor} lacks monotonicity={monotonicity:.2f}, dropping")
+                                    df = df.drop(columns=[factor])
+                        else:
+                            logger.warning(f"Factor {factor} has insufficient quantiles, dropping")
+                            df = df.drop(columns=[factor])
+                    except Exception as e:
+                        logger.warning(f"Error in monotonicity test for {factor}: {e}, dropping")
+                        df = df.drop(columns=[factor])
+        
+        logger.info(f"Factor quality control completed. Remaining factors: {[c for c in df.columns if c in factor_cols]}")
         return df
 
     def _winsorize_factors(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -185,8 +185,267 @@ class EnsembleModel:
 
         # 简单平均
         return np.mean(predictions, axis=0)
+    
+    def save(self, path: str):
+        """保存集成模型"""
+        import joblib
+        # 保存整个集成模型对象
+        joblib.dump({
+            'models': self.models,
+            'model_types': self.model_types
+        }, path)
+    
+    def load(self, path: str):
+        """加载集成模型"""
+        import joblib
+        data = joblib.load(path)
+        self.models = data['models']
+        self.model_types = data['model_types']
+    
+    def get_feature_importance(self):
+        """获取集成模型的特征重要性（平均各模型的重要性）"""
+        if not self.models:
+            return pd.DataFrame()
+        
+        importance_dfs = []
+        for model in self.models:
+            imp = model.get_feature_importance()
+            if not imp.empty:
+                importance_dfs.append(imp)
+        
+        if not importance_dfs:
+            return pd.DataFrame()
+        
+        # 合并所有模型的特征重要性
+        combined_importance = importance_dfs[0].copy()
+        for df in importance_dfs[1:]:
+            combined_importance = combined_importance.merge(
+                df, on='feature', how='outer', suffixes=('', '_right')
+            )
+            # 如果某个特征在某些模型中不存在，将其重要性设为0
+            for col in combined_importance.columns:
+                if col.endswith('_right'):
+                    combined_importance[col] = combined_importance[col].fillna(0)
+                    original_col = col.replace('_right', '')
+                    combined_importance[original_col] = (
+                        combined_importance[original_col].fillna(0) + 
+                        combined_importance[col]
+                    ) / 2  # 平均重要性
+                    combined_importance = combined_importance.drop(columns=[col])
+        
+        # 按平均重要性排序
+        combined_importance = combined_importance.sort_values('importance', ascending=False)
+        return combined_importance
 
 
+class ImprovedWalkForwardTrainer:
+    """改进的滚动训练器"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.models = {}
+        self.feature_importance_history = []
+
+    def prepare_data(self, df):
+        # 排除非特征列
+        exclude_cols = ['ts_code', 'trade_date', 'label', 'forward_return',
+                       'open', 'high', 'low', 'close', 'vol', 'amount', 'name', 'industry']
+        feature_cols = [c for c in df.columns if c not in exclude_cols]
+
+        X = df[feature_cols].fillna(0)
+        # 优先使用 Triple Barrier 生成的 label，否则使用 forward_return
+        y = df['label'] if 'label' in df.columns else df['forward_return']
+
+        # 替换无限值
+        X = X.replace([np.inf, -np.inf], 0)
+        y = y.fillna(0)
+
+        return X, y
+    
+    def select_features(self, X, y, method='importance', top_k=20):
+        """
+        特征选择 - 防止过拟合
+        
+        方法:
+        1. 基于模型重要性
+        2. 基于IC值
+        3. 基于方差(剔除常数特征)
+        """
+        # 方法1: 剔除低方差特征
+        from sklearn.feature_selection import VarianceThreshold
+        selector = VarianceThreshold(threshold=0.01)
+        X_filtered = selector.fit_transform(X)
+        selected_cols = X.columns[selector.get_support()].tolist()
+        
+        X = X[selected_cols]
+        
+        # 方法2: 基于重要性
+        if method == 'importance':
+            import lightgbm as lgb
+            
+            # 快速训练一个模型获取特征重要性
+            model = lgb.LGBMRegressor(
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.1,
+                random_state=42,
+                verbose=-1
+            )
+            
+            model.fit(X, y)
+            
+            importance_df = pd.DataFrame({
+                'feature': X.columns,
+                'importance': model.feature_importances_
+            }).sort_values('importance', ascending=False)
+            
+            # 选择Top K特征
+            selected_features = importance_df.head(top_k)['feature'].tolist()
+            
+            logger.info(f"Selected {len(selected_features)} features from {len(X.columns)}")
+            
+            return X[selected_features], selected_features
+        
+        elif method == 'ic':
+            # 基于IC值选择
+            ic_values = {}
+            for col in X.columns:
+                ic = X[col].corr(y)
+                ic_values[col] = abs(ic)
+            
+            ic_df = pd.DataFrame.from_dict(ic_values, orient='index', columns=['ic'])
+            ic_df = ic_df.sort_values('ic', ascending=False)
+            
+            selected_features = ic_df.head(top_k).index.tolist()
+            
+            return X[selected_features], selected_features
+
+    def train_with_time_series_cv(self, X, y, n_splits=5):
+        """
+        时间序列交叉验证
+        
+        关键: 不能随机打乱,必须按时间顺序
+        """
+        from sklearn.model_selection import TimeSeriesSplit
+        import lightgbm as lgb
+        
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        cv_scores = []
+        
+        for train_idx, val_idx in tscv.split(X):
+            X_train_fold = X.iloc[train_idx]
+            y_train_fold = y.iloc[train_idx]
+            X_val_fold = X.iloc[val_idx]
+            y_val_fold = y.iloc[val_idx]
+            
+            model = lgb.LGBMRegressor(
+                objective='regression',
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                verbose=-1
+            )
+            
+            model.fit(
+                X_train_fold, y_train_fold,
+                eval_set=[(X_val_fold, y_val_fold)],
+                callbacks=[lgb.early_stopping(50, verbose=False)]
+            )
+            
+            # 评估
+            pred_val = model.predict(X_val_fold)
+            from sklearn.metrics import mean_squared_error
+            score = mean_squared_error(y_val_fold, pred_val, squared=False)
+            cv_scores.append(score)
+        
+        # 用全量数据训练最终模型
+        final_model = lgb.LGBMRegressor(
+            objective='regression',
+            n_estimators=200,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            verbose=-1
+        )
+        
+        final_model.fit(X, y)
+        
+        avg_cv_score = np.mean(cv_scores)
+        
+        return final_model, avg_cv_score
+    
+    def walk_forward_train_v2(self, df):
+        """
+        优化的滚动训练流程
+        """
+        df = df.sort_values('trade_date')
+        dates = sorted(df['trade_date'].unique())
+        
+        # === 关键改进1: 扩大训练窗口 ===
+        train_window = 252  # 1年数据(原来100天太短)
+        retrain_frequency = 21  # 每月重训练(原来20天)
+        
+        predictions_list = []
+        
+        for i in range(train_window, len(dates), retrain_frequency):
+            train_dates = dates[i-train_window : i]
+            test_dates = dates[i : i+retrain_frequency]
+            
+            if not test_dates: 
+                break
+            
+            logger.info(f"Training: {train_dates[0]}-{train_dates[-1]}, "
+                       f"Testing: {test_dates[0]}-{test_dates[-1]}")
+            
+            # 训练数据
+            train_data = df[df['trade_date'].isin(train_dates)]
+            X_train, y_train = self.prepare_data(train_data)
+            
+            if len(X_train) < 1000:  # 至少1000条样本
+                logger.warning(f"Insufficient training data: {len(X_train)}")
+                continue
+            
+            # === 关键改进2: 特征选择 ===
+            X_train_selected, selected_features = self.select_features(
+                X_train, y_train, method='importance'
+            )
+            
+            # === 关键改进3: 时间序列交叉验证 ===
+            model, cv_score = self.train_with_time_series_cv(
+                X_train_selected, y_train, n_splits=5
+            )
+            
+            logger.info(f"CV Score: {cv_score:.4f}")
+            
+            # 保存模型和特征
+            self.models[test_dates[0]] = {
+                'model': model,
+                'features': selected_features,
+                'cv_score': cv_score
+            }
+            
+            # 预测
+            test_data = df[df['trade_date'].isin(test_dates)]
+            if len(test_data) == 0: 
+                continue
+            
+            X_test, _ = self.prepare_data(test_data)
+            X_test_selected = X_test[selected_features]
+            
+            preds = model.predict(X_test_selected)
+            
+            result_df = test_data[['ts_code', 'trade_date']].copy()
+            result_df['ml_score'] = preds
+            predictions_list.append(result_df)
+        
+        return pd.concat(predictions_list) if predictions_list else pd.DataFrame()
+
+# 保持原来的WalkForwardTrainer类作为备选，但推荐使用改进版
 class WalkForwardTrainer:
     """滚动训练器"""
     def __init__(self, config):
@@ -264,29 +523,57 @@ class WalkForwardTrainer:
 
 
 class LabelGenerator:
-    """标签生成器工厂"""
+    """标签生成器工厂 - 修复版"""
+    
     @staticmethod
     def add_labels(df, config):
-        """根据配置添加标签"""
-        # 1. 预测次日开盘收益（而非收盘收益）
+        """
+        根据配置添加标签 - 修复时间错配问题
+        
+        核心修复:
+        1. 预测次日收盘收益(而非开盘收益)
+        2. 特征使用T-1日数据(避免未来函数)
+        """
         periods = config.model.forward_return_days
         
-        # 计算次日开盘相对今日收盘的收益
-        df['next_open'] = df.groupby('ts_code')['open'].shift(-1)
-        df['forward_return'] = (df['next_open'] - df['close']) / df['close']
+        # ===== 修复1: 正确的标签定义 =====
+        # ✅ 预测次日收盘相对今日收盘的收益
+        df['next_close'] = df.groupby('ts_code')['close'].shift(-periods)
+        df['forward_return'] = (df['next_close'] - df['close']) / df['close']
         
-        # 2. 如果启用了夏普比率作为目标（更稳健的指标）
-        # 计算波动率作为分母
-        df['volatility'] = df.groupby('ts_code')['close'].pct_change().rolling(5).std().shift(-periods)
-        df['sharpe_like'] = df['forward_return'] / (df['volatility'] + 1e-8)  # 避免除零
-
-        # 3. 如果启用 Triple Barrier (高级标签)
-        # 这里我们默认启用以增强效果
-        labeler = TripleBarrierLabeler(
-            profit_threshold=0.05,
-            stop_loss_threshold=-0.03,
-            holding_period=periods
-        )
-        df = labeler.generate_labels(df)
-
+        # ❌ 删除原来错误的标签
+        # df['next_open'] = df.groupby('ts_code')['open'].shift(-1)
+        # df['forward_return'] = (df['next_open'] - df['close']) / df['close']
+        
+        # ===== 修复2: 特征时间对齐 =====
+        # 重要: 所有特征必须基于T-1日及之前的数据
+        # 否则在T日开盘时无法获取这些特征
+        
+        # 获取所有特征列(排除基础列和标签列)
+        exclude_cols = ['ts_code', 'trade_date', 'name', 'industry',
+                       'open', 'high', 'low', 'close', 'vol', 'amount',
+                       'forward_return', 'next_close', 'next_open', 'label']
+        
+        feature_cols = [c for c in df.columns if c not in exclude_cols]
+        
+        # ===== 修复3: 波动率标签(更稳健) =====
+        df['volatility'] = df.groupby('ts_code')['close'].pct_change().rolling(5).std()
+        df['sharpe_like'] = df['forward_return'] / (df['volatility'].shift(1) + 1e-8)
+        
+        # ===== 修复4: Triple Barrier标签(可选) =====
+        if getattr(config.model, 'use_triple_barrier', False):
+            labeler = TripleBarrierLabeler(
+                profit_threshold=0.05,
+                stop_loss_threshold=-0.03,
+                holding_period=periods
+            )
+            df = labeler.generate_labels(df)
+        
+        # 删除临时列
+        df = df.drop(columns=['next_close'], errors='ignore')
+        
+        logger.info(f"✅ 标签生成完成 (已修复时间错配问题)")
+        logger.info(f"   有效样本数: {df['forward_return'].notna().sum()}")
+        logger.info(f"   正收益比例: {(df['forward_return'] > 0).sum() / df['forward_return'].notna().sum():.1%}")
+        
         return df

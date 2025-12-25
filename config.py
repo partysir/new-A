@@ -9,8 +9,23 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from datetime import datetime
 
+
+
+class ConfigMixin:
+    """配置类混入，提供字典式访问"""
+
+    def get(self, key: str, default=None):
+        """支持字典式访问"""
+        return getattr(self, key, default)
+
+    def __getitem__(self, key: str):
+        """支持 config['key'] 访问"""
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(f"'{key}' not found")
+
 @dataclass
-class DataConfig:
+class DataConfig(ConfigMixin):
     """数据配置"""
     # Tushare配置
     tushare_token: str = "2876ea85cb005fb5fa17c809a98174f2d5aae8b1f830110a5ead6211"  # 请替换为您的token
@@ -29,14 +44,14 @@ class DataConfig:
 
     # 数据范围
     start_date: str = "20230101"
-    end_date: str = None  # None表示当前日期
+    end_date: Optional[str] = None  # None表示当前日期
 
     # 更新频率
     update_frequency: str = "daily"  # daily, weekly, monthly
 
 
 @dataclass
-class FactorConfig:
+class FactorConfig(ConfigMixin):
     """因子配置"""
     # 技术因子
     technical_factors: List[str] = field(default_factory=lambda: [
@@ -106,7 +121,7 @@ class FactorConfig:
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(ConfigMixin):
     """模型配置"""
     # 模型类型
     model_type: str = "xgboost"  # xgboost, lightgbm, catboost, ensemble
@@ -166,7 +181,7 @@ class ModelConfig:
 
 
 @dataclass
-class StrategyConfig:
+class StrategyConfig(ConfigMixin):
     """策略配置"""
     # 选股
     top_n: int = 10  # 持仓数量
@@ -199,7 +214,7 @@ class StrategyConfig:
 
 
 @dataclass
-class RiskConfig:
+class RiskConfig(ConfigMixin):
     """风控配置"""
     # 止损
     use_stop_loss: bool = True
@@ -244,14 +259,14 @@ class RiskConfig:
 
 
 @dataclass
-class BacktestConfig:
+class BacktestConfig(ConfigMixin):
     """回测配置"""
     initial_capital: float = 1000000  # 初始资金
     benchmark: str = "000300.SH"  # 基准指数(沪深300)
 
     # 回测参数
     start_date: str = "20200101"
-    end_date: str = None  # None表示当前日期
+    end_date: Optional[str] = None  # None表示当前日期
 
     # 报告
     output_dir: str = "./output"
@@ -267,7 +282,7 @@ class BacktestConfig:
 
 
 @dataclass
-class SystemConfig:
+class SystemConfig(ConfigMixin):
     """系统配置"""
     # 日志
     log_level: str = "INFO"  # DEBUG, INFO, WARNING, ERROR
