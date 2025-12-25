@@ -305,13 +305,25 @@ class EnhancedLiveStrategy:
         if len(df) == 0:
             return df
         
-        # 【临时】如果没有财务数据，直接返回（避免全部过滤掉）
+        # 🟢 修复: 填充缺失的财务数据为中性值或允许通过
+        # 避免因单一指标缺失导致整只股票被过滤
+        fill_values = {
+            'roe': 0.05, 
+            'net_margin': 0.05, 
+            'revenue_yoy': 0.1, 
+            'profit_yoy': 0.1,
+            'pe_ttm': 20,
+            'debt_to_asset': 0.5
+        }
+        df_filled = df.fillna(fill_values)
+
+        # 🟢 修复: 检查是否有财务数据，如果没有则跳过筛选
         has_financial = any(col in df.columns for col in ['roe', 'pe', 'pb', 'debt_to_asset'])
         if not has_financial:
             logger.warning("  ⚠ 无财务数据，跳过财务筛选")
             return df
 
-        df = df.copy()
+        df = df_filled  # 使用填充后的数据
         
         # 初始化质量得分
         quality_scores = pd.Series(0, index=df.index)
@@ -339,8 +351,13 @@ class EnhancedLiveStrategy:
 
         df['quality_score'] = quality_scores
 
-        # 保留质量得分>=1的股票（原来是>=2）
-        return df[df['quality_score'] >= 1].copy()  # 降低门槛
+        # 🟢 降低门槛: 如果没有通过的，尝试保留 Top N
+        result = df[df['quality_score'] >= 1].copy()
+        if result.empty and not df.empty:
+            logger.warning("财务筛选过于严格，返回原始候选列表")
+            return df 
+            
+        return result
 
     def _classify_market_state(self, index_data: pd.DataFrame) -> str:
         """判断市场状态"""
@@ -424,10 +441,17 @@ class EnhancedLiveStrategy:
                 df = df[df['momentum_20'] > 0]
 
         elif market_state == 'weak_bear':
-            # 弱势市场: 选防御性行业
+            # 🔴 原逻辑：只选防御性行业
+            # if 'industry' in df.columns:
+            #     defensive_industries = ['医药', '食品饮料', '银行', '公用事业']
+            #     df = df[df['industry'].isin(defensive_industries)]
+            
+            # 🟢 修改为：优先防御，但如果股票极其优质（评分很高），也放行
             if 'industry' in df.columns:
                 defensive_industries = ['医药', '食品饮料', '银行', '公用事业']
-                df = df[df['industry'].isin(defensive_industries)]
+                is_defensive = df['industry'].isin(defensive_industries)
+                # 保留防御行业 OR 评分极高(>0.7)的股票
+                df = df[is_defensive | (df['ml_score'] > 0.7)]
 
         elif market_state == 'strong_bear':
             # 强烈下跌: 只选超跌
@@ -508,10 +532,12 @@ class EnhancedLiveStrategy:
             'S': 0.12,  # 超优: 12%
             'A': 0.08,  # 优秀: 8%
             'B': 0.05,  # 良好: 5%
-            'C': 0.03  # 一般: 3%
+            'C': 0.03   # 一般: 3%
         }
 
-        df['weight'] = df['position_tier'].map(position_map)
+        # 🟢 修复后代码（添加 .astype(float)）：
+        # 先转为 object/string 再 map，或者 map 后强制转 float，确保它是数值
+        df['weight'] = df['position_tier'].astype(object).map(position_map).astype(float)
 
         # 🟢 优化：不要强制归一化到1，而是设置单日最大总仓位
         total_weight = df['weight'].sum()

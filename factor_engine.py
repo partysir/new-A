@@ -99,6 +99,13 @@ class FactorEngine:
 
     def _calculate_technical_factors(self, df: pd.DataFrame) -> pd.DataFrame:
         """计算技术因子（稳健版）"""
+        
+        # ✅ 新增：无条件计算基础均线（放在函数开头）
+        df['ma5'] = df['close'].rolling(5).mean()
+        df['ma10'] = df['close'].rolling(10).mean()
+        df['ma20'] = df['close'].rolling(20).mean()
+        df['ma60'] = df['close'].rolling(60).mean()
+
         # === 改进1: 多周期动量综合 ===
         # 不只看单一周期,综合多个周期减少噪音
         if 'momentum_composite' in self.config.factor.technical_factors:
@@ -145,11 +152,6 @@ class FactorEngine:
         # === 改进5: 趋势一致性(多周期) ===
         # MA5 > MA10 > MA20 > MA60 = 多头排列
         if 'trend_alignment' in self.config.factor.technical_factors:
-            df['ma5'] = df['close'].rolling(5).mean()
-            df['ma10'] = df['close'].rolling(10).mean()
-            df['ma20'] = df['close'].rolling(20).mean()
-            df['ma60'] = df['close'].rolling(60).mean()
-            
             df['trend_alignment'] = (
                 (df['ma5'] > df['ma10']).astype(int) +
                 (df['ma10'] > df['ma20']).astype(int) +
@@ -395,14 +397,18 @@ class FactorEngine:
                 continue
                 
             # 1. 检查缺失率
+            # 🟢 修改点 1: 提高缺失率容忍度 (从 0.3 改为 0.8 或更高)
+            # 在实盘中，即使很多股票没有数据，我们也要保留列，为了那些有数据的股票
             missing_rate = df[factor].isna().sum() / len(df)
-            if missing_rate > 0.3:
+            if missing_rate > 0.8:  # 只有当80%以上都缺失时才剔除
                 logger.warning(f"Factor {factor} has {missing_rate:.1%} missing, dropping")
                 df = df.drop(columns=[factor])
                 continue
             
-            # 2. 检查信息系数(IC) - 如果有forward_return列
+            # 🟢 修改点 2: 仅在有 'forward_return' 时才检查 IC 和单调性
+            # 实盘推理时 df 中没有 'forward_return'，这段逻辑会自动跳过，这是对的。
             if 'forward_return' in df.columns:
+                # 2. 检查信息系数(IC) - 如果有forward_return列
                 # 计算IC时去除NaN值
                 mask = ~(df[factor].isna() | df['forward_return'].isna())
                 if mask.sum() > 100:  # 确保有足够的数据点
@@ -411,10 +417,9 @@ class FactorEngine:
                         logger.warning(f"Factor {factor} has low IC={ic:.4f}, dropping")
                         df = df.drop(columns=[factor])
                         continue
-            
-            # 3. 检查单调性(防止过拟合) - 如果有forward_return列
-            # 好的因子应该在分组后收益单调递增/递减
-            if 'forward_return' in df.columns:
+                
+                # 3. 检查单调性(防止过拟合) - 如果有forward_return列
+                # 好的因子应该在分组后收益单调递增/递减
                 # 创建因子分组
                 mask = ~(df[factor].isna() | df['forward_return'].isna())
                 if mask.sum() > 100:  # 确保有足够的数据点
@@ -435,9 +440,9 @@ class FactorEngine:
                                 if pd.isna(monotonicity) or abs(monotonicity) < 0.5:
                                     logger.warning(f"Factor {factor} lacks monotonicity={monotonicity:.2f}, dropping")
                                     df = df.drop(columns=[factor])
-                        else:
-                            logger.warning(f"Factor {factor} has insufficient quantiles, dropping")
-                            df = df.drop(columns=[factor])
+                            else:
+                                logger.warning(f"Factor {factor} has insufficient quantiles, dropping")
+                                df = df.drop(columns=[factor])
                     except Exception as e:
                         logger.warning(f"Error in monotonicity test for {factor}: {e}, dropping")
                         df = df.drop(columns=[factor])

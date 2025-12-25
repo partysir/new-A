@@ -62,7 +62,7 @@ def get_latest_available_trading_date(cache_dir, lookback=5):
 def main():
     parser = argparse.ArgumentParser(description='增强版实盘选股推荐系统 v3.0')
     parser.add_argument('--date', type=str, help='指定日期 (格式: YYYYMMDD)')
-    parser.add_argument('--lookback', type=int, default=90, help='回看天数 (默认90天)')
+    parser.add_argument('--lookback', type=int, default=150, help='回看天数 (建议150天以上)')
     parser.add_argument('--debug', action='store_true', help='调试模式')
     args = parser.parse_args()
 
